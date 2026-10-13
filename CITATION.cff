@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use NXC-Siesta, please cite the paper below and this software."
+title: "NXC-Siesta: neural-network exchange-correlation functionals in SIESTA"
+version: 1.0.0
+license: GPL-3.0-only
+repository-code: "https://github.com/marivifsSBU/NXC-Siesta"
+authors:
+  - family-names: Navarro-Rodríguez
+    given-names: Sara
+    affiliation: Catalan Institute of Nanoscience and Nanotechnology (ICN2)
+  - family-names: Fernández-Serra
+    given-names: Marivi
+    affiliation: Stony Brook University
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Navarro-Rodríguez
+      given-names: Sara
+    - family-names: Wills
+      given-names: Alec
+    - family-names: Daas
+      given-names: Kim J.
+    - family-names: Camarasa-Gómez
+      given-names: María
+    - family-names: Fernández-Serra
+      given-names: Marivi
+  title: "Constraint-aware functional cloning for stable and transferable machine-learned density functional theory"
+  journal: arXiv
+  identifier: "arXiv:2605.10331"
+  year: 2026

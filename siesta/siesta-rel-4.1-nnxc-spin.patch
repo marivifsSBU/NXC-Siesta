@@ -1,0 +1,1209 @@
+diff --git a/Src/SiestaXC/ggaxc.f b/Src/SiestaXC/ggaxc.f
+index 03bf58003..463e1c0b9 100644
+--- a/Src/SiestaXC/ggaxc.f
++++ b/Src/SiestaXC/ggaxc.f
+@@ -44,12 +44,13 @@
+ !
+ !******************************************************************************
+ 
+-      MODULE m_ggaxc
++       MODULE m_ggaxc
+ 
+       ! Used module procedures
+-      use sys,     only: die     ! Termination routine
+-      USE m_ldaxc, only: exchng  ! Local exchange
+-      USE m_ldaxc, only: pw92c   ! Perdew & Wang, PRB, 45, 13244 (1992) correl
++      use sys,     only: die
++      use m_ldaxc, only: exchng
++      use m_ldaxc, only: pw92c
++      use xc_nn_siesta
+ 
+ 
+       ! Used module parameters
+@@ -307,6 +308,10 @@ C Non collinear part rewritten by J.M.Soler. Sept. 2009
+         CALL BHX( IREL, NS, DD, GDD,
+      .            EPSX, EPSC, dEXdDD, dECdDD, dEXdGDD, dECdGDD ) 
+ 
++      ELSEIF (AUTHOR.EQ.'NNGGA' .OR. AUTHOR.EQ.'nngga') THEN
++        CALL NNGGAXC( IREL, NS, DD, GDD,
++     .               EPSX, EPSC, dEXdDD, dECdDD, dEXdGDD, dECdGDD )
++
+       ELSE
+         call die('GGAXC: Unknown author ' // trim(AUTHOR))
+       ENDIF
+diff --git a/Src/SiestaXC/makefile b/Src/SiestaXC/makefile
+index 5ca159e95..6f677ca05 100644
+--- a/Src/SiestaXC/makefile
++++ b/Src/SiestaXC/makefile
+@@ -5,6 +5,8 @@
+ ARCH_MAKE_DEFAULT=../arch.make
+ ARCH_MAKE?=$(ARCH_MAKE_DEFAULT)
+ include $(ARCH_MAKE)
++# Minimal fix: fdf.mod lives in ../fdf relative to SiestaXC
++INCFLAGS += -I../fdf
+ #
+ # Use first sources here, then in the top level
+ VPATH:=$(VPATH_ROOT)/SiestaXC:$(VPATH_ROOT)
+@@ -14,7 +16,9 @@ default: module
+ # Note: The copy operation below is only a possible way to
+ #       make the module and library files accessible.
+ #
+-module:  libSiestaXC.a
++module:
++	$(MAKE) xc_nn.o
++	$(MAKE) libSiestaXC.a
+ 	cp *.mod *.a ..
+ #
+ SIESTA_SRCS= alloc.F90 bessph.f cellsubs.f  debugmpi.F \
+@@ -31,8 +35,8 @@ SIESTA_OBJS:= $(SIESTA_OBJS:.F90=.o)
+ #
+ SIESTA_SOURCES:=$(addprefix ../, $(SIESTA_SRCS))
+ 
+-LOCAL_SRCS= atomxc.F90 cellxc.F90 debugxc.f90 ggaxc.f ldaxc.f \
+-            siestaxc.F90 vdwxc.F90 xcmod.f90  fft3d.F90 fftr.F90 \
++LOCAL_SRCS= atomxc.F90 cellxc.F90 debugxc.f90 xc_nn.f90 xc_nn_siesta.f90 ggaxc.f ldaxc.f \
++            siestaxc.F90 vdwxc.F90 xcmod.f90 fft3d.F90 fftr.F90 \
+             mesh1d.f90 mesh3d.F90 am05.f90 vv_vdwxc.F90 array.F90 local_sys.F
+ LOCAL_OBJS:= $(LOCAL_SRCS:.f=.o)
+ LOCAL_OBJS:= $(LOCAL_OBJS:.F=.o)
+@@ -86,7 +90,7 @@ debugmpi.o: parallel.o
+ fft1d.o: parallel.o precision.o local_sys.o
+ fft3d.o: alloc.o debugxc.o fft1d.o m_timer.o mesh3d.o precision.o local_sys.o
+ fftr.o: alloc.o fft3d.o mesh3d.o precision.o local_sys.o
+-ggaxc.o: ldaxc.o precision.o local_sys.o am05.o
++ggaxc.o: ldaxc.o precision.o local_sys.o am05.o xc_nn.o xc_nn_siesta.o
+ interpolation.o: precision.o
+ ldaxc.o: precision.o local_sys.o
+ m_io.o: local_sys.o
+@@ -107,4 +111,3 @@ vdwxc.o: precision.o radfft.o vv_vdwxc.o local_sys.o
+ vv_vdwxc.o: alloc.o debugxc.o interpolation.o mesh1d.o
+ vv_vdwxc.o: precision.o radfft.o local_sys.o
+ xcmod.o: precision.o local_sys.o vdwxc.o
+-
+diff --git a/Src/SiestaXC/xc_nn.f90 b/Src/SiestaXC/xc_nn.f90
+new file mode 100644
+index 000000000..cbb6246a4
+--- /dev/null
++++ b/Src/SiestaXC/xc_nn.f90
+@@ -0,0 +1,796 @@
++! xc_nn.f90
++!
++!======================================================================
++! SiestaXC neural-network XC (NNXC) engine
++!
++! This module implements the low-level NN forward pass for the GGA
++! enhancement factors Fx and Fc, plus analytic derivatives with respect
++! to the NN feature inputs (x0,x1,x2).
++!
++! Important implementation note (GELU):
++!   The JAX reference implementation uses `jax.nn.gelu` with the default
++!   `approximate=True` in JAX 0.7.0, i.e. the tanh-approx GELU.
++!   To obtain bitwise-consistent results between Fortran and JAX, the
++!   Fortran `gelu` and `dgelu` below use the tanh-approximation:
++!     gelu(x) = 0.5*x*(1 + tanh( sqrt(2/pi)*(x + 0.044715*x^3) ))
++!   and its analytic derivative.
++!
++! Debug support:
++!   NNXC_DEBUG_RAW (below) can be toggled temporarily to print the raw
++!   last-layer output `y` (pre-LOB) at a specific x2 value. It should
++!   remain `.false.` for production builds.
++!
++!======================================================================
++module xc_nn
++  implicit none
++  private
++  public :: load_xc_nn_weights
++  public :: load_xc_nn_weights_nofdf
++  public :: fx_forward_and_grad3, fc_forward_and_grad3
++  public :: model_fx_from_rho_grad, model_fc_from_rho_grad
++  public :: gelu, dgelu
++
++  integer, parameter :: dp = kind(1.0d0)
++  integer, save :: debug_count_fc = 0
++  integer, parameter :: NNXC_MODE_TL = 1, NNXC_MODE_UNCT = 2
++  integer, save :: FX_MODE = NNXC_MODE_TL
++  integer, save :: FC_MODE = NNXC_MODE_TL
++
++  ! NOTE: keep .false. for production; set .true. only during debugging.
++  ! Debug controls (set to .true. temporarily when diagnosing JAX/Fortran mismatches)
++  logical, parameter :: NNXC_DEBUG_RAW = .false.
++  real(dp), parameter :: NNXC_DEBUG_X2_TARGET = 1.336560450412419_dp
++  real(dp), parameter :: NNXC_DEBUG_TOL = 1.0d-12
++  logical, save :: nnxc_printed_fx_raw = .false.
++  logical, save :: nnxc_printed_fc_raw = .false.
++
++  ! Network architecture (can be overridden via the .fdf input).
++  ! We compile with MAX sizes and use FX_IN/FX_H/FC_IN/FC_H at runtime.
++  integer, parameter :: FX_IN_MAX = 3, FX_H_MAX = 256, FX_OUT = 1
++  integer, parameter :: FC_IN_MAX = 3, FC_H_MAX = 256, FC_OUT = 1
++
++  ! Defaults (match the common notebook/exporter setup):
++  !   Fx: in=1 (uses x2 only), hidden=16
++  !   Fc: in=3 (uses x0,x1,x2), hidden=16
++  integer, save :: FX_IN = 1, FX_H = 16
++  integer, save :: FC_IN = 3, FC_H = 16
++
++  ! Weights and biases for Fx: shapes match numpy (out, in)
++  real(dp), save :: W_fx1(FX_H_MAX, FX_IN_MAX), b_fx1(FX_H_MAX)
++  real(dp), save :: W_fx2(FX_H_MAX, FX_H_MAX),  b_fx2(FX_H_MAX)
++  real(dp), save :: W_fx3(FX_H_MAX, FX_H_MAX),  b_fx3(FX_H_MAX)
++  real(dp), save :: W_fx4(FX_OUT,  FX_H_MAX),   b_fx4(FX_OUT)
++
++  ! Weights and biases for Fc
++  real(dp), save :: W_fc1(FC_H_MAX, FC_IN_MAX), b_fc1(FC_H_MAX)
++  real(dp), save :: W_fc2(FC_H_MAX, FC_H_MAX),  b_fc2(FC_H_MAX)
++  real(dp), save :: W_fc3(FC_H_MAX, FC_H_MAX),  b_fc3(FC_H_MAX)
++  real(dp), save :: W_fc4(FC_OUT,  FC_H_MAX),   b_fc4(FC_OUT)
++
++  ! Lieb–Oxford limits (must match your Python models)
++  real(dp), parameter :: LOB_FX = 1.804_dp
++  real(dp), parameter :: LOB_FC = 2.0_dp
++
++contains
++
++  !---------------- GELU and its derivative ----------------
++
++  pure function gelu(x) result(y)
++    real(dp), intent(in) :: x
++    real(dp) :: y
++    real(dp), parameter :: a = 0.79788456080286535588_dp  ! sqrt(2/pi)
++    real(dp), parameter :: c = 0.044715_dp
++    real(dp) :: u
++
++    u = a * (x + c * x*x*x)
++    y = 0.5_dp * x * (1.0_dp + tanh(u))
++  end function gelu
++
++  pure function dgelu(x) result(dy)
++    real(dp), intent(in) :: x
++    real(dp) :: dy
++    real(dp), parameter :: a = 0.79788456080286535588_dp  ! sqrt(2/pi)
++    real(dp), parameter :: c = 0.044715_dp
++    real(dp) :: u, t, du_dx
++
++    u = a * (x + c * x*x*x)
++    t = tanh(u)
++    du_dx = a * (1.0_dp + 3.0_dp*c*x*x)
++
++    dy = 0.5_dp * (1.0_dp + t) + 0.5_dp * x * (1.0_dp - t*t) * du_dx
++  end function dgelu
++
++  !---------------- LOB and its derivative -----------------
++
++  pure function lob(x, limit) result(y)
++    real(dp), intent(in) :: x, limit
++    real(dp) :: y
++    real(dp) :: u, s
++    u = x - log(limit - 1.0_dp)
++    s = 1.0_dp / (1.0_dp + exp(-u))   ! sigmoid(u)
++    y = limit * s - 1.0_dp
++  end function lob
++
++  pure function dlob(x, limit) result(dy)
++    real(dp), intent(in) :: x, limit
++    real(dp) :: dy
++    real(dp) :: u, s
++    u = x - log(limit - 1.0_dp)
++    s = 1.0_dp / (1.0_dp + exp(-u))
++    dy = limit * s * (1.0_dp - s)
++  end function dlob
++
++  !---------------- I/O helper -----------------
++
++  subroutine read_matrix(filename, A)
++    character(len=*), intent(in) :: filename
++    real(dp), intent(out) :: A(:,:)
++    integer :: iostat, i, j
++    open(unit=77, file=filename, status='old', action='read', iostat=iostat)
++    if (iostat /= 0) then
++       write(*,*) "Error opening ", trim(filename), " iostat=", iostat
++       stop
++    end if
++    ! Read matrix in row-major order to match numpy's default
++    read(77, *, iostat=iostat) ((A(i,j), j=1,size(A,2)), i=1,size(A,1))
++    if (iostat /= 0) then
++       write(*,*) "Error reading ", trim(filename), " iostat=", iostat, &
++                  " expected shape=(", size(A,1), ",", size(A,2), ")"
++       stop
++    end if
++    close(77)
++  end subroutine read_matrix
++
++  subroutine read_vector(filename, v)
++    character(len=*), intent(in) :: filename
++    real(dp), intent(out) :: v(:)
++    integer :: iostat
++    open(unit=78, file=filename, status='old', action='read', iostat=iostat)
++    if (iostat /= 0) then
++       write(*,*) "Error opening ", trim(filename), " iostat=", iostat
++       stop
++    end if
++    read(78, *, iostat=iostat) v
++    if (iostat /= 0) then
++       write(*,*) "Error reading ", trim(filename), " iostat=", iostat, &
++                  " expected length=", size(v)
++       stop
++    end if
++    close(78)
++  end subroutine read_vector
++
++  !---------------- Public loader -----------------
++
++  subroutine load_xc_nn_weights(prefix)
++    use fdf, only: fdf_string
++    ! prefix is the same --out-prefix used in the exporter (e.g. 'xc_nn')
++    character(len=*), intent(in) :: prefix
++    character(len=256) :: fname
++    character(len=256) :: sval
++    integer :: ios
++    integer :: fx_in_new, fx_h_new, fc_in_new, fc_h_new
++    integer :: fx_mode_new, fc_mode_new
++
++    ! Optional overrides from the .fdf file:
++    !   NNXC.FX_IN, NNXC.FX_H, NNXC.FC_IN, NNXC.FC_H
++    !   NNXC.H sets both hidden sizes (shorthand)
++    fx_in_new = FX_IN
++    fx_h_new  = FX_H
++    fc_in_new = FC_IN
++    fc_h_new  = FC_H
++    fx_mode_new = FX_MODE
++    fc_mode_new = FC_MODE
++
++    sval = fdf_string('NNXC.H', '')
++    if (len_trim(sval) > 0) then
++       read(sval, *, iostat=ios) fx_h_new
++       if (ios /= 0) then
++          write(*,*) "Error parsing NNXC.H = ", trim(sval)
++          stop
++       end if
++       fc_h_new = fx_h_new
++    end if
++
++    sval = fdf_string('NNXC.FX_IN', '')
++    if (len_trim(sval) > 0) then
++       read(sval, *, iostat=ios) fx_in_new
++       if (ios /= 0) then
++          write(*,*) "Error parsing NNXC.FX_IN = ", trim(sval)
++          stop
++       end if
++    end if
++
++    sval = fdf_string('NNXC.FX_H', '')
++    if (len_trim(sval) > 0) then
++       read(sval, *, iostat=ios) fx_h_new
++       if (ios /= 0) then
++          write(*,*) "Error parsing NNXC.FX_H = ", trim(sval)
++          stop
++       end if
++    end if
++
++    sval = fdf_string('NNXC.FC_IN', '')
++    if (len_trim(sval) > 0) then
++       read(sval, *, iostat=ios) fc_in_new
++       if (ios /= 0) then
++          write(*,*) "Error parsing NNXC.FC_IN = ", trim(sval)
++          stop
++       end if
++    end if
++
++    sval = fdf_string('NNXC.FC_H', '')
++    if (len_trim(sval) > 0) then
++       read(sval, *, iostat=ios) fc_h_new
++       if (ios /= 0) then
++          write(*,*) "Error parsing NNXC.FC_H = ", trim(sval)
++          stop
++       end if
++    end if
++
++    sval = fdf_string('NNXC.FX_MODE', '')
++    if (len_trim(sval) > 0) then
++       select case (trim(adjustl(sval)))
++       case ('TL','tl','Tl','tL')
++          fx_mode_new = NNXC_MODE_TL
++       case ('UNCT','unct','Unct','uNCT','unCt','uncT')
++          fx_mode_new = NNXC_MODE_UNCT
++       case default
++          write(*,*) "Error parsing NNXC.FX_MODE = ", trim(sval), " (supported: TL or UNCT)"
++          stop
++       end select
++    end if
++
++    sval = fdf_string('NNXC.FC_MODE', '')
++    if (len_trim(sval) > 0) then
++       select case (trim(adjustl(sval)))
++       case ('TL','tl','Tl','tL')
++          fc_mode_new = NNXC_MODE_TL
++       case ('UNCT','unct','Unct','uNCT','unCt','uncT')
++          fc_mode_new = NNXC_MODE_UNCT
++       case default
++          write(*,*) "Error parsing NNXC.FC_MODE = ", trim(sval), " (supported: TL or UNCT)"
++          stop
++       end select
++    end if
++
++    if (.not.(fx_in_new == 1 .or. fx_in_new == 3)) then
++       write(*,*) "NNXC: unsupported FX_IN=", fx_in_new, " (supported: 1 or 3)"
++       stop
++    end if
++    if (.not.(fc_in_new == 1 .or. fc_in_new == 3)) then
++       write(*,*) "NNXC: unsupported FC_IN=", fc_in_new, " (supported: 1 or 3)"
++       stop
++    end if
++    if (fx_h_new <= 0 .or. fc_h_new <= 0) then
++       write(*,*) "NNXC: hidden sizes must be > 0. FX_H=", fx_h_new, " FC_H=", fc_h_new
++       stop
++    end if
++    if (fx_in_new > FX_IN_MAX .or. fx_h_new > FX_H_MAX .or. fc_in_new > FC_IN_MAX .or. fc_h_new > FC_H_MAX) then
++       write(*,*) "NNXC: requested dims exceed compiled MAX. Requested: ", &
++                  "FX_IN=", fx_in_new, " FX_H=", fx_h_new, " FC_IN=", fc_in_new, " FC_H=", fc_h_new
++       write(*,*) "NNXC: compiled MAX: FX_IN_MAX=", FX_IN_MAX, " FX_H_MAX=", FX_H_MAX, &
++                  " FC_IN_MAX=", FC_IN_MAX, " FC_H_MAX=", FC_H_MAX
++       stop
++    end if
++
++    FX_IN = fx_in_new
++    FX_H  = fx_h_new
++    FC_IN = fc_in_new
++    FC_H  = fc_h_new
++    FX_MODE = fx_mode_new
++    FC_MODE = fc_mode_new
++
++    write(*,*) "NNXC architecture: FX_IN=", FX_IN, " FX_H=", FX_H, " FC_IN=", FC_IN, " FC_H=", FC_H, &
++               " FX_MODE=", FX_MODE, " FC_MODE=", FC_MODE
++
++    ! Fx
++    write(fname,'(a,"_fx_W1.dat")') trim(prefix)
++    call read_matrix(fname, W_fx1(1:FX_H, 1:FX_IN))
++    write(fname,'(a,"_fx_b1.dat")') trim(prefix)
++    call read_vector(fname, b_fx1(1:FX_H))
++
++    write(fname,'(a,"_fx_W2.dat")') trim(prefix)
++    call read_matrix(fname, W_fx2(1:FX_H, 1:FX_H))
++    write(fname,'(a,"_fx_b2.dat")') trim(prefix)
++    call read_vector(fname, b_fx2(1:FX_H))
++
++    write(fname,'(a,"_fx_W3.dat")') trim(prefix)
++    call read_matrix(fname, W_fx3(1:FX_H, 1:FX_H))
++    write(fname,'(a,"_fx_b3.dat")') trim(prefix)
++    call read_vector(fname, b_fx3(1:FX_H))
++
++    write(fname,'(a,"_fx_W4.dat")') trim(prefix)
++    call read_matrix(fname, W_fx4(1:FX_OUT, 1:FX_H))
++    write(fname,'(a,"_fx_b4.dat")') trim(prefix)
++    call read_vector(fname, b_fx4)
++
++    ! Fc
++    write(fname,'(a,"_fc_W1.dat")') trim(prefix)
++    call read_matrix(fname, W_fc1(1:FC_H, 1:FC_IN))
++    write(fname,'(a,"_fc_b1.dat")') trim(prefix)
++    call read_vector(fname, b_fc1(1:FC_H))
++
++    write(fname,'(a,"_fc_W2.dat")') trim(prefix)
++    call read_matrix(fname, W_fc2(1:FC_H, 1:FC_H))
++    write(fname,'(a,"_fc_b2.dat")') trim(prefix)
++    call read_vector(fname, b_fc2(1:FC_H))
++
++    write(fname,'(a,"_fc_W3.dat")') trim(prefix)
++    call read_matrix(fname, W_fc3(1:FC_H, 1:FC_H))
++    write(fname,'(a,"_fc_b3.dat")') trim(prefix)
++    call read_vector(fname, b_fc3(1:FC_H))
++
++    write(fname,'(a,"_fc_W4.dat")') trim(prefix)
++    call read_matrix(fname, W_fc4(1:FC_OUT, 1:FC_H))
++    write(fname,'(a,"_fc_b4.dat")') trim(prefix)
++    call read_vector(fname, b_fc4)
++
++    write(*,*) "Loaded XC NN weights with prefix ", trim(prefix)
++  end subroutine load_xc_nn_weights
++
++  !---------------- Public loader (no FDF required) -----------------
++
++  subroutine load_xc_nn_weights_nofdf(prefix)
++    ! Standalone/test helper: load weights using current FX_IN/FX_H/FC_IN/FC_H
++    ! without touching the FDF subsystem.
++    character(len=*), intent(in) :: prefix
++    character(len=256) :: fname
++
++    if (.not.(FX_IN == 1 .or. FX_IN == 3)) then
++       write(*,*) "NNXC: unsupported FX_IN=", FX_IN, " (supported: 1 or 3)"
++       stop
++    end if
++    if (.not.(FC_IN == 1 .or. FC_IN == 3)) then
++       write(*,*) "NNXC: unsupported FC_IN=", FC_IN, " (supported: 1 or 3)"
++       stop
++    end if
++    if (FX_H <= 0 .or. FC_H <= 0) then
++       write(*,*) "NNXC: hidden sizes must be > 0. FX_H=", FX_H, " FC_H=", FC_H
++       stop
++    end if
++    if (FX_IN > FX_IN_MAX .or. FX_H > FX_H_MAX .or. FC_IN > FC_IN_MAX .or. FC_H > FC_H_MAX) then
++       write(*,*) "NNXC: requested dims exceed compiled MAX. Requested: ", &
++                  "FX_IN=", FX_IN, " FX_H=", FX_H, " FC_IN=", FC_IN, " FC_H=", FC_H
++       write(*,*) "NNXC: compiled MAX: FX_IN_MAX=", FX_IN_MAX, " FX_H_MAX=", FX_H_MAX, &
++                  " FC_IN_MAX=", FC_IN_MAX, " FC_H_MAX=", FC_H_MAX
++       stop
++    end if
++
++    write(*,*) "NNXC architecture (noFDF): FX_IN=", FX_IN, " FX_H=", FX_H, " FC_IN=", FC_IN, " FC_H=", FC_H
++
++    ! Fx
++    write(fname,'(a,"_fx_W1.dat")') trim(prefix)
++    call read_matrix(fname, W_fx1(1:FX_H, 1:FX_IN))
++    write(fname,'(a,"_fx_b1.dat")') trim(prefix)
++    call read_vector(fname, b_fx1(1:FX_H))
++
++    write(fname,'(a,"_fx_W2.dat")') trim(prefix)
++    call read_matrix(fname, W_fx2(1:FX_H, 1:FX_H))
++    write(fname,'(a,"_fx_b2.dat")') trim(prefix)
++    call read_vector(fname, b_fx2(1:FX_H))
++
++    write(fname,'(a,"_fx_W3.dat")') trim(prefix)
++    call read_matrix(fname, W_fx3(1:FX_H, 1:FX_H))
++    write(fname,'(a,"_fx_b3.dat")') trim(prefix)
++    call read_vector(fname, b_fx3(1:FX_H))
++
++    write(fname,'(a,"_fx_W4.dat")') trim(prefix)
++    call read_matrix(fname, W_fx4(1:FX_OUT, 1:FX_H))
++    write(fname,'(a,"_fx_b4.dat")') trim(prefix)
++    call read_vector(fname, b_fx4)
++
++    ! Fc
++    write(fname,'(a,"_fc_W1.dat")') trim(prefix)
++    call read_matrix(fname, W_fc1(1:FC_H, 1:FC_IN))
++    write(fname,'(a,"_fc_b1.dat")') trim(prefix)
++    call read_vector(fname, b_fc1(1:FC_H))
++
++    write(fname,'(a,"_fc_W2.dat")') trim(prefix)
++    call read_matrix(fname, W_fc2(1:FC_H, 1:FC_H))
++    write(fname,'(a,"_fc_b2.dat")') trim(prefix)
++    call read_vector(fname, b_fc2(1:FC_H))
++
++    write(fname,'(a,"_fc_W3.dat")') trim(prefix)
++    call read_matrix(fname, W_fc3(1:FC_H, 1:FC_H))
++    write(fname,'(a,"_fc_b3.dat")') trim(prefix)
++    call read_vector(fname, b_fc3(1:FC_H))
++
++    write(fname,'(a,"_fc_W4.dat")') trim(prefix)
++    call read_matrix(fname, W_fc4(1:FC_OUT, 1:FC_H))
++    write(fname,'(a,"_fc_b4.dat")') trim(prefix)
++    call read_vector(fname, b_fc4)
++
++    write(*,*) "Loaded XC NN weights with prefix (noFDF) ", trim(prefix)
++  end subroutine load_xc_nn_weights_nofdf
++
++  !---------------- Fx MLP + LOB: forward + d/dx0,d/dx1,d/dx2 -----------------
++
++  subroutine fx_forward_and_grad3(x0, x1, x2, Fx, dFx_dx0, dFx_dx1, dFx_dx2)
++    ! Inputs:  x0, x1, x2
++    ! Output:  TL   mode: Fx = 1 + LOB(x2 * MLP_x(...))
++    !          UNCT mode: Fx = MLP_x(...)
++    !          dFx_dx0, dFx_dx1, dFx_dx2
++    real(dp), intent(in)  :: x0, x1, x2
++    real(dp), intent(out) :: Fx, dFx_dx0, dFx_dx1, dFx_dx2
++
++    real(dp) :: a0(FX_IN_MAX)
++    real(dp) :: z1(FX_H_MAX), a1(FX_H_MAX)
++    real(dp) :: z2(FX_H_MAX), a2(FX_H_MAX)
++    real(dp) :: z3(FX_H_MAX), a3(FX_H_MAX)
++    real(dp) :: z4(FX_OUT)
++    real(dp) :: y
++    real(dp) :: delta3(FX_H_MAX), delta2(FX_H_MAX), delta1(FX_H_MAX)
++    real(dp) :: grad_in(FX_IN_MAX)
++    real(dp) :: zlob, dlobdz
++    integer :: i, j
++
++    ! Forward: map (x0,x1,x2) -> NN inputs
++    a0 = 0.0_dp
++    if (FX_IN == 1) then
++       a0(1) = x2
++    else if (FX_IN == 3) then
++       a0(1) = x0
++       a0(2) = x1
++       a0(3) = x2
++    else
++       write(*,*) "NNXC: unsupported FX_IN=", FX_IN, " (supported: 1 or 3)"
++       stop
++    end if
++
++    do i = 1, FX_H
++       z1(i) = b_fx1(i)
++       do j = 1, FX_IN
++          z1(i) = z1(i) + W_fx1(i,j) * a0(j)
++       end do
++       a1(i) = gelu(z1(i))
++    end do
++
++    do i = 1, FX_H
++       z2(i) = b_fx2(i)
++       do j = 1, FX_H
++          z2(i) = z2(i) + W_fx2(i,j) * a1(j)
++       end do
++       a2(i) = gelu(z2(i))
++    end do
++
++    do i = 1, FX_H
++       z3(i) = b_fx3(i)
++       do j = 1, FX_H
++          z3(i) = z3(i) + W_fx3(i,j) * a2(j)
++       end do
++       a3(i) = gelu(z3(i))
++    end do
++
++    do i = 1, FX_OUT
++       z4(i) = b_fx4(i)
++       do j = 1, FX_H
++          z4(i) = z4(i) + W_fx4(i,j) * a3(j)
++       end do
++    end do
++    y = z4(1)
++
++    if (NNXC_DEBUG_RAW) then
++       if ((.not. nnxc_printed_fx_raw) .and. (abs(x2 - NNXC_DEBUG_X2_TARGET) < NNXC_DEBUG_TOL)) then
++          write(*,'("FX raw y=",1PE24.16,"  x0=",1PE24.16," x1=",1PE24.16," x2=",1PE24.16)') y, x0, x1, x2
++          nnxc_printed_fx_raw = .true.
++       end if
++    end if
++
++    select case (FX_MODE)
++    case (NNXC_MODE_TL)
++       ! Apply LOB: Fx = 1 + lob(x2 * y, LOB_FX)
++       zlob = x2 * y
++       Fx   = 1.0_dp + lob(zlob, LOB_FX)
++    case (NNXC_MODE_UNCT)
++       Fx = y
++    case default
++       write(*,*) "NNXC: unsupported FX_MODE=", FX_MODE
++       stop
++    end select
++
++    ! Backprop to get dy/dx0,dy/dx1,dy/dx2
++    do i = 1, FX_H
++       delta3(i) = 0.0_dp
++       do j = 1, FX_OUT
++          delta3(i) = delta3(i) + W_fx4(j,i) * 1.0_dp
++       end do
++       delta3(i) = delta3(i) * dgelu(z3(i))
++    end do
++
++    do i = 1, FX_H
++       delta2(i) = 0.0_dp
++       do j = 1, FX_H
++          delta2(i) = delta2(i) + W_fx3(j,i) * delta3(j)
++       end do
++       delta2(i) = delta2(i) * dgelu(z2(i))
++    end do
++
++    do i = 1, FX_H
++       delta1(i) = 0.0_dp
++       do j = 1, FX_H
++          delta1(i) = delta1(i) + W_fx2(j,i) * delta2(j)
++       end do
++       delta1(i) = delta1(i) * dgelu(z1(i))
++    end do
++
++    grad_in = 0.0_dp
++    do j = 1, FX_IN
++       do i = 1, FX_H
++          grad_in(j) = grad_in(j) + W_fx1(i,j) * delta1(i)
++       end do
++    end do
++
++    select case (FX_MODE)
++    case (NNXC_MODE_TL)
++       dlobdz  = dlob(zlob, LOB_FX)
++       ! Fx = 1 + LOB(x2 * y)
++       if (FX_IN == 1) then
++          dFx_dx0 = 0.0_dp
++          dFx_dx1 = 0.0_dp
++          dFx_dx2 = dlobdz * ( y  + x2 * grad_in(1) )
++       else if (FX_IN == 3) then
++          dFx_dx0 = dlobdz * ( x2 * grad_in(1) )
++          dFx_dx1 = dlobdz * ( x2 * grad_in(2) )
++          dFx_dx2 = dlobdz * ( y  + x2 * grad_in(3) )
++       else
++          write(*,*) "NNXC: unsupported FX_IN=", FX_IN, " (supported: 1 or 3)"
++          stop
++       end if
++    case (NNXC_MODE_UNCT)
++       if (FX_IN == 1) then
++          dFx_dx0 = 0.0_dp
++          dFx_dx1 = 0.0_dp
++          dFx_dx2 = grad_in(1)
++       else if (FX_IN == 3) then
++          dFx_dx0 = grad_in(1)
++          dFx_dx1 = grad_in(2)
++          dFx_dx2 = grad_in(3)
++       else
++          write(*,*) "NNXC: unsupported FX_IN=", FX_IN, " (supported: 1 or 3)"
++          stop
++       end if
++    case default
++       write(*,*) "NNXC: unsupported FX_MODE=", FX_MODE
++       stop
++    end select
++
++  end subroutine fx_forward_and_grad3
++
++  !---------------- Fc MLP + LOB: forward + d/dx0,d/dx1,d/dx2 -----------------
++
++  subroutine fc_forward_and_grad3(x0, x1, x2, Fc, dFc_dx0, dFc_dx1, dFc_dx2)
++    ! Inputs:  x0, x1, x2
++    ! Output:  TL   mode: Fc = 1 + LOB(x2 * MLP_c(...))
++    !          UNCT mode: Fc = MLP_c(...)
++    !          dFc_dx0, dFc_dx1, dFc_dx2
++    real(dp), intent(in)  :: x0, x1, x2
++    real(dp), intent(out) :: Fc, dFc_dx0, dFc_dx1, dFc_dx2
++
++    real(dp) :: a0(FC_IN_MAX)
++    real(dp) :: z1(FC_H_MAX), a1(FC_H_MAX)
++    real(dp) :: z2(FC_H_MAX), a2(FC_H_MAX)
++    real(dp) :: z3(FC_H_MAX), a3(FC_H_MAX)
++    real(dp) :: z4(FC_OUT)
++    real(dp) :: y
++    real(dp) :: delta3(FC_H_MAX), delta2(FC_H_MAX), delta1(FC_H_MAX)
++    real(dp) :: grad_in(FC_IN_MAX)
++    real(dp) :: zlob, dlobdz
++    integer :: i, j
++
++    ! Forward: map (x0,x1,x2) -> NN inputs
++    a0 = 0.0_dp
++    if (FC_IN == 1) then
++       a0(1) = x2
++    else if (FC_IN == 3) then
++       a0(1) = x0
++       a0(2) = x1
++       a0(3) = x2
++    else
++       write(*,*) "NNXC: unsupported FC_IN=", FC_IN, " (supported: 1 or 3)"
++       stop
++    end if
++
++    do i = 1, FC_H
++       z1(i) = b_fc1(i)
++       do j = 1, FC_IN
++          z1(i) = z1(i) + W_fc1(i,j) * a0(j)
++       end do
++       a1(i) = gelu(z1(i))
++    end do
++
++    do i = 1, FC_H
++       z2(i) = b_fc2(i)
++       do j = 1, FC_H
++          z2(i) = z2(i) + W_fc2(i,j) * a1(j)
++       end do
++       a2(i) = gelu(z2(i))
++    end do
++
++    do i = 1, FC_H
++       z3(i) = b_fc3(i)
++       do j = 1, FC_H
++          z3(i) = z3(i) + W_fc3(i,j) * a2(j)
++       end do
++       a3(i) = gelu(z3(i))
++    end do
++
++    do i = 1, FC_OUT
++       z4(i) = b_fc4(i)
++       do j = 1, FC_H
++          z4(i) = z4(i) + W_fc4(i,j) * a3(j)
++       end do
++    end do
++    y = z4(1)
++
++    if (NNXC_DEBUG_RAW) then
++       if ((.not. nnxc_printed_fc_raw) .and. (abs(x2 - NNXC_DEBUG_X2_TARGET) < NNXC_DEBUG_TOL)) then
++          write(*,'("FC raw y=",1PE24.16,"  x0=",1PE24.16," x1=",1PE24.16," x2=",1PE24.16)') y, x0, x1, x2
++          nnxc_printed_fc_raw = .true.
++       end if
++    end if
++
++    select case (FC_MODE)
++    case (NNXC_MODE_TL)
++       zlob = x2 * y
++       Fc   = 1.0_dp + lob(zlob, LOB_FC)
++    case (NNXC_MODE_UNCT)
++       Fc = y
++    case default
++       write(*,*) "NNXC: unsupported FC_MODE=", FC_MODE
++       stop
++    end select
++
++    ! Backprop to get dy/dx0, dy/dx1, dy/dx2
++    do i = 1, FC_H
++       delta3(i) = 0.0_dp
++       do j = 1, FC_OUT
++          delta3(i) = delta3(i) + W_fc4(j,i) * 1.0_dp
++       end do
++       delta3(i) = delta3(i) * dgelu(z3(i))
++    end do
++
++    do i = 1, FC_H
++       delta2(i) = 0.0_dp
++       do j = 1, FC_H
++          delta2(i) = delta2(i) + W_fc3(j,i) * delta3(j)
++       end do
++       delta2(i) = delta2(i) * dgelu(z2(i))
++    end do
++
++    do i = 1, FC_H
++       delta1(i) = 0.0_dp
++       do j = 1, FC_H
++          delta1(i) = delta1(i) + W_fc2(j,i) * delta2(j)
++       end do
++       delta1(i) = delta1(i) * dgelu(z1(i))
++    end do
++
++    grad_in = 0.0_dp
++    do j = 1, FC_IN
++       do i = 1, FC_H
++          grad_in(j) = grad_in(j) + W_fc1(i,j) * delta1(i)
++       end do
++    end do
++
++    select case (FC_MODE)
++    case (NNXC_MODE_TL)
++       dlobdz   = dlob(zlob, LOB_FC)
++       ! Fc = 1 + LOB(x2 * y)
++       if (FC_IN == 1) then
++          dFc_dx0 = 0.0_dp
++          dFc_dx1 = 0.0_dp
++          dFc_dx2 = dlobdz * ( y  + x2 * grad_in(1) )
++       else if (FC_IN == 3) then
++          dFc_dx0 = dlobdz * ( x2 * grad_in(1) )
++          dFc_dx1 = dlobdz * ( x2 * grad_in(2) )
++          dFc_dx2 = dlobdz * ( y  + x2 * grad_in(3) )
++       else
++          write(*,*) "NNXC: unsupported FC_IN=", FC_IN, " (supported: 1 or 3)"
++          stop
++       end if
++    case (NNXC_MODE_UNCT)
++       if (FC_IN == 1) then
++          dFc_dx0 = 0.0_dp
++          dFc_dx1 = 0.0_dp
++          dFc_dx2 = grad_in(1)
++       else if (FC_IN == 3) then
++          dFc_dx0 = grad_in(1)
++          dFc_dx1 = grad_in(2)
++          dFc_dx2 = grad_in(3)
++       else
++          write(*,*) "NNXC: unsupported FC_IN=", FC_IN, " (supported: 1 or 3)"
++          stop
++       end if
++    case default
++       write(*,*) "NNXC: unsupported FC_MODE=", FC_MODE
++       stop
++    end select
++
++    ! Debug print disabled
++    debug_count_fc = debug_count_fc + 1
++
++  end subroutine fc_forward_and_grad3
++
++
++  !---------------- Top-level model wrappers: (rho,grad_rho) -> Fx,Fc -----------------
++  !
++  ! Legacy wrappers (rho,|grad rho|) -> Fx/Fc
++  ! --------------------------------------
++  ! These wrappers implement an older feature convention (log10-based)
++  ! and are retained for backwards compatibility and ad hoc testing.
++  !
++  ! The production SIESTA path uses `xc_nn_siesta.f90` (NNGGAXC), which
++  ! constructs features with natural logs and the spin-scaling / zeta'
++  ! definitions validated against the JAX reference.
++  !
++  ! If you are debugging JAX↔Fortran consistency, prefer the NNGGAXC path
++  ! (or the standalone debug testers), not these wrappers.
++  !
++
++  subroutine model_fx_from_rho_grad(rho, grad_rho, Fx)
++    !! Fortran version of GGA_Fx_G_transf_lin.__call__(inputs=[rho, grad_rho])
++    implicit none
++    real(dp), intent(in)  :: rho, grad_rho
++    real(dp), intent(out) :: Fx
++    real(dp) :: kF, s, s2, x0, x1, x2
++    real(dp) :: dFx_dx0, dFx_dx1, dFx_dx2
++    real(dp), parameter :: pi = acos(-1.0_dp)
++
++    if (rho <= 0.0_dp) then
++       Fx = 1.0_dp
++       return
++    end if
++
++    ! k_F = (3 * pi^2 * rho)^(1/3)
++    kF = (3.0_dp * pi*pi * rho)**(1.0_dp/3.0_dp)
++    ! s = |grad rho| / (2 k_F rho)
++    s  = grad_rho / (2.0_dp * kF * rho)
++    s2 = s*s
++
++    ! x2 = log10(1 + s) * (1 - exp(-s^2))  (legacy)
++    x2 = log10(1.0_dp + s) * (1.0_dp - exp(-s2))
++
++    ! x0 = log10(rho^(1/3) + eps)  (legacy)
++    x0 = log10(rho**(1.0_dp/3.0_dp) + 1.0d-5)
++
++    ! Unpolarized spin feature: zeta' = 1 => x1 = log10(1 + eps)  (legacy)
++    x1 = log10(1.0_dp + 1.0d-5)
++
++    call fx_forward_and_grad3(x0, x1, x2, Fx, dFx_dx0, dFx_dx1, dFx_dx2)
++  end subroutine model_fx_from_rho_grad
++
++
++  subroutine model_fc_from_rho_grad(rho, grad_rho, Fc)
++    !! Fortran version of GGA_Fc_G_transf_lin.__call__(inputs=[rho, grad_rho])
++    implicit none
++    real(dp), intent(in)  :: rho, grad_rho
++    real(dp), intent(out) :: Fc
++    real(dp) :: kF, s, s2, x0, x1, x2
++    real(dp) :: dFc_dx0, dFc_dx1, dFc_dx2
++    real(dp), parameter :: eps = 1.0d-5
++    real(dp), parameter :: pi  = acos(-1.0_dp)
++
++    if (rho <= 0.0_dp) then
++       Fc = 1.0_dp
++       return
++    end if
++
++    ! k_F = (3 * pi^2 * rho)^(1/3)
++    kF = (3.0_dp * pi*pi * rho)**(1.0_dp/3.0_dp)
++    ! s = |grad rho| / (2 k_F rho)
++    s  = grad_rho / (2.0_dp * kF * rho)
++    s2 = s*s
++
++    ! x2 = log10(1 + s) * (1 - exp(-s^2))  (legacy)
++    x2 = log10(1.0_dp + s) * (1.0_dp - exp(-s2))
++
++    ! x0 = log10(rho^(1/3) + eps)  (legacy)
++    x0 = log10(rho**(1.0_dp/3.0_dp) + eps)
++
++    ! Unpolarized spin feature: zeta' = 1 => x1 = log10(1 + eps)  (legacy)
++    x1 = log10(1.0_dp + eps)
++
++    call fc_forward_and_grad3(x0, x1, x2, Fc, dFc_dx0, dFc_dx1, dFc_dx2)
++  end subroutine model_fc_from_rho_grad
++
++end module xc_nn
+\ No newline at end of file
+diff --git a/Src/SiestaXC/xc_nn_siesta.f90 b/Src/SiestaXC/xc_nn_siesta.f90
+new file mode 100644
+index 000000000..36d4ecc69
+--- /dev/null
++++ b/Src/SiestaXC/xc_nn_siesta.f90
+@@ -0,0 +1,317 @@
++!======================================================================
++! xc_nn_siesta.f90
++!----------------------------------------------------------------------
++! SIESTA-facing interface for the NN-based GGA XC functional (NNXC).
++!
++! This module implements:
++!   - NNGGAXC: SIESTA callback returning (EX, EC) and first derivatives
++!              of the *energy density* w.r.t. densities and density
++!              gradients, in the format expected by SIESTA.
++!   - NNXC_INIT: standalone/test initializer to load NN weights without
++!                requiring the FDF subsystem.
++!
++! Conceptual note:
++!   SIESTA computes the final XC potential on the real-space grid using
++!   numerical divergence operators (Balbás & Soler, PRB 64, 165110).
++!   Therefore, this routine returns only first derivatives of the energy
++!   density with respect to its local inputs (rho, zeta, gradients).
++!
++! Numerical safety:
++!   Reduced gradients involve divisions by rho and kF(rho). To avoid
++!   NaNs at (or extremely near) vacuum points, we use a tiny additive
++!   denominator in the reduced-gradient definitions.
++!
++!======================================================================
++module xc_nn_siesta
++  use precision, only: dp
++  use m_ldaxc, only: exchng, pw92c
++  use xc_nn
++  use fdf, only: fdf_string
++  implicit none
++  private
++  public :: NNGGAXC, NNXC_INIT
++
++  logical, save :: nn_weights_loaded = .false.
++  character(len=256), save :: nn_prefix = ''
++
++contains
++
++  !--------------------------------------------------------------------
++  ! NNXC_INIT(prefix)
++  !   Standalone/test helper: loads NN weights without requiring FDF.
++  !   For production SIESTA runs, NNGGAXC will load weights from FDF.
++  !--------------------------------------------------------------------
++  subroutine NNXC_INIT(prefix)
++    ! Standalone/test initializer: load NN weights without requiring FDF.
++    implicit none
++    character(len=*), intent(in) :: prefix
++
++    nn_prefix = trim(prefix)
++    call load_xc_nn_weights_nofdf(trim(nn_prefix))
++    nn_weights_loaded = .true.
++  end subroutine NNXC_INIT
++
++  subroutine NNGGAXC( IREL, nSpin, Dens, GDens, &
++                      EX, EC, dEXdD, dECdD, dEXdGD, dECdGD )
++    implicit none
++    integer, intent(in) :: IREL, nSpin
++    real(dp), intent(in)  :: Dens(nSpin), GDens(3,nSpin)
++    real(dp), intent(out) :: EX, EC
++    real(dp), intent(out) :: dEXdD(nSpin), dECdD(nSpin)
++    real(dp), intent(out) :: dEXdGD(3,nSpin), dECdGD(3,nSpin)
++
++    integer :: is, k
++    real(dp) :: rho, ru, rd, Gtot(3), g, tiny
++    real(dp), parameter :: tiny_denom = 1.0d-30
++
++    ! LDA references (exchange via EXCHNG, correlation via PW92C)
++    real(dp) :: epsx_LDA, epsc_LDA
++    real(dp) :: ex_den, ec_den
++    real(dp) :: densx(1), exu_up, exu_dn, vxu_up(1), vxu_dn(1)
++    real(dp) :: Dlda(2), vcunif(2), ecunif
++
++    ! NN outputs and partial derivatives wrt NN inputs (x0,x1,x2)
++    real(dp) :: Fx_u, dFx_dx0_u, dFx_dx1_u, dFx_dx2_u
++    real(dp) :: Fx_d, dFx_dx0_d, dFx_dx1_d, dFx_dx2_d
++    real(dp) :: Fc, dFc_dx0, dFc_dx1, dFc_dx2
++
++    ! Feature definitions
++    real(dp) :: pi, b_kF, kF
++    real(dp) :: x0_u, x1_u, x2_u
++    real(dp) :: x0_d, x1_d, x2_d
++    real(dp) :: x0_c, x1_c, x2_c
++    real(dp) :: dx0_drho_u, dx0_drho_d, dx0_drho_c
++    real(dp) :: dx1_dru, dx1_drd
++    real(dp) :: dx2_ds_u, dx2_ds_d, dx2_ds_c
++    real(dp) :: dx2_drho_c, dx2_dg_c
++    real(dp) :: ds_drho_u, ds_drho_d, ds_dg_u, ds_dg_d
++    real(dp) :: ds_drho_c, ds_dg_c
++
++    ! Additional local declarations
++    real(dp) :: s
++    real(dp) :: dx2_drho_u, dx2_drho_d
++    real(dp) :: dFx_drho_u, dFx_drho_d
++    real(dp) :: dFx_dg_u, dFx_dg_d
++
++    ! Derivatives of energy density (per volume) wrt rho and |grad rho|
++    real(dp) :: dedrho_x(2), dedrho_c(2)
++    real(dp) :: dedg_x_u, dedg_x_d, dedg_c
++
++    ! Gradients per spin
++    real(dp) :: GradU(3), GradD(3)
++    real(dp) :: gU, gD, suu, sdd, sud
++
++    ! Exchange energy density per spin
++    real(dp) :: ex_den_up, ex_den_dn
++
++    ! Temporary variables
++    real(dp) :: rho2_u, rho2_d, kF2_u, kF2_d, s_u, s_d
++    real(dp) :: s2_u, s2_d, s2_c
++    real(dp) :: zeta, zeta_p, dzeta_dru, dzeta_drd, dzp_dzeta, dx1_dzeta
++
++    if (nSpin /= 1 .and. nSpin /= 2) then
++      call die('NNGGAXC: nSpin>2 not implemented')
++    end if
++
++    if (.not.nn_weights_loaded) then
++      ! Read NN parameter prefix from the input file (fdf) the first time.
++      if (len_trim(nn_prefix) == 0) then
++        nn_prefix = fdf_string('NNXC.Prefix', 'nn_params/xc_nn')
++      end if
++      call load_xc_nn_weights(trim(nn_prefix))
++      nn_weights_loaded = .true.
++    end if
++
++    tiny = 1.0d-14
++    pi   = acos(-1.0_dp)
++    b_kF = (3.0_dp*pi*pi)**(1.0_dp/3.0_dp)
++
++    ! Spin handling
++    if (nSpin == 1) then
++      rho = Dens(1)
++      ru  = 0.5_dp * rho
++      rd  = 0.5_dp * rho
++      Gtot(1) = GDens(1,1)
++      Gtot(2) = GDens(2,1)
++      Gtot(3) = GDens(3,1)
++      GradU = 0.5_dp * GDens(:,1)
++      GradD = 0.5_dp * GDens(:,1)
++    else
++      ru  = Dens(1)
++      rd  = Dens(2)
++      rho = ru + rd
++      Gtot(1) = GDens(1,1) + GDens(1,2)
++      Gtot(2) = GDens(2,1) + GDens(2,2)
++      Gtot(3) = GDens(3,1) + GDens(3,2)
++      GradU = GDens(:,1)
++      GradD = GDens(:,2)
++    end if
++
++    if (rho <= tiny) then
++      EX = 0.0_dp; EC = 0.0_dp
++      dEXdD(:)    = 0.0_dp
++      dECdD(:)    = 0.0_dp
++      dEXdGD(:,:) = 0.0_dp
++      dECdGD(:,:) = 0.0_dp
++      return
++    end if
++
++    gU = sqrt(sum(GradU**2))
++    gD = sqrt(sum(GradD**2))
++    g = sqrt(Gtot(1)**2 + Gtot(2)**2 + Gtot(3)**2)
++    suu = sum(GradU**2)
++    sdd = sum(GradD**2)
++    sud = sum(GradU*GradD)
++
++    densx(1) = max(tiny, 2.0_dp*ru)
++    call exchng(IREL, 1, densx, exu_up, vxu_up)
++
++    densx(1) = max(tiny, 2.0_dp*rd)
++    call exchng(IREL, 1, densx, exu_dn, vxu_dn)
++
++    ex_den_up = ru * exu_up
++    ex_den_dn = rd * exu_dn
++
++    if (nSpin == 1) then
++      Dlda(1) = 0.5_dp*rho
++      Dlda(2) = 0.5_dp*rho
++    else
++      Dlda(1) = ru
++      Dlda(2) = rd
++    end if
++    call pw92c(2, Dlda, ecunif, vcunif)
++    epsc_LDA = ecunif
++    ec_den   = rho * epsc_LDA
++
++    ! Exchange NN (up)
++    rho2_u = max(tiny, 2.0_dp*ru)
++    kF2_u = (3.0_dp*pi*pi*rho2_u)**(1.0_dp/3.0_dp)
++    s_u = gU / (kF2_u * rho2_u + tiny_denom)
++    if (s_u < -1.0_dp) s_u = 0.0_dp
++    x0_u = log(rho2_u**(1.0_dp/3.0_dp) + 1.0d-5)
++    x1_u = log(1.0d-5 + 1.0_dp)
++    s2_u = s_u*s_u
++    x2_u = (1.0_dp - exp(-s2_u)) * log(1.0_dp + s_u)
++    dx2_ds_u = 2.0_dp*s_u*exp(-s2_u)*log(1.0_dp + s_u) + (1.0_dp - exp(-s2_u)) / (1.0_dp + s_u)
++    call fx_forward_and_grad3(x0_u, x1_u, x2_u, Fx_u, dFx_dx0_u, dFx_dx1_u, dFx_dx2_u)
++
++    ! Exchange NN (down)
++    rho2_d = max(tiny, 2.0_dp*rd)
++    kF2_d = (3.0_dp*pi*pi*rho2_d)**(1.0_dp/3.0_dp)
++    s_d = gD / (kF2_d * rho2_d + tiny_denom)
++    if (s_d < -1.0_dp) s_d = 0.0_dp
++    x0_d = log(rho2_d**(1.0_dp/3.0_dp) + 1.0d-5)
++    x1_d = log(1.0d-5 + 1.0_dp)
++    s2_d = s_d*s_d
++    x2_d = (1.0_dp - exp(-s2_d)) * log(1.0_dp + s_d)
++    dx2_ds_d = 2.0_dp*s_d*exp(-s2_d)*log(1.0_dp + s_d) + (1.0_dp - exp(-s2_d)) / (1.0_dp + s_d)
++    call fx_forward_and_grad3(x0_d, x1_d, x2_d, Fx_d, dFx_dx0_d, dFx_dx1_d, dFx_dx2_d)
++
++    ex_den = ex_den_up*Fx_u + ex_den_dn*Fx_d
++    EX = ex_den / rho
++
++    ! Correlation NN (total)
++    zeta = (ru - rd) / rho
++    zeta = max(-1.0_dp, min(1.0_dp, zeta))
++    zeta_p = 0.5_dp * ( (1.0_dp + zeta)**(4.0_dp/3.0_dp) + (1.0_dp - zeta)**(4.0_dp/3.0_dp) )
++    x1_c = log(zeta_p + 1.0d-5)
++    x0_c = log(rho**(1.0_dp/3.0_dp) + 1.0d-5)
++    kF = (3.0_dp*pi*pi*rho)**(1.0_dp/3.0_dp)
++    s = g / (2.0_dp * kF * rho + tiny_denom)
++    if (s < -1.0_dp) s = 0.0_dp
++    s2_c = s*s
++    x2_c = (1.0_dp - exp(-s2_c)) * log(1.0_dp + s)
++    dx2_ds_c = 2.0_dp*s*exp(-s2_c)*log(1.0_dp + s) + (1.0_dp - exp(-s2_c)) / (1.0_dp + s)
++    call fc_forward_and_grad3(x0_c, x1_c, x2_c, Fc, dFc_dx0, dFc_dx1, dFc_dx2)
++    EC = Fc * epsc_LDA
++
++    ! Density derivatives
++    dx0_drho_u = ( (1.0_dp/3.0_dp) * rho2_u**(-2.0_dp/3.0_dp) ) / (rho2_u**(1.0_dp/3.0_dp) + 1.0d-5)
++    ds_drho_u = -(4.0_dp/3.0_dp) * s_u / rho2_u
++    ds_dg_u = 1.0_dp / (kF2_u * rho2_u)
++    dx2_drho_u = dx2_ds_u * ds_drho_u
++    dFx_drho_u = (dFx_dx0_u * dx0_drho_u + dFx_dx2_u * dx2_drho_u) * 2.0_dp
++    dedrho_x(1) = Fx_u * vxu_up(1) + ex_den_up * dFx_drho_u
++
++    dx0_drho_d = ( (1.0_dp/3.0_dp) * rho2_d**(-2.0_dp/3.0_dp) ) / (rho2_d**(1.0_dp/3.0_dp) + 1.0d-5)
++    ds_drho_d = -(4.0_dp/3.0_dp) * s_d / rho2_d
++    ds_dg_d = 1.0_dp / (kF2_d * rho2_d)
++    dx2_drho_d = dx2_ds_d * ds_drho_d
++    dFx_drho_d = (dFx_dx0_d * dx0_drho_d + dFx_dx2_d * dx2_drho_d) * 2.0_dp
++    dedrho_x(2) = Fx_d * vxu_dn(1) + ex_den_dn * dFx_drho_d
++
++    dx0_drho_c = ( (1.0_dp/3.0_dp) * rho**(-2.0_dp/3.0_dp) ) / (rho**(1.0_dp/3.0_dp) + 1.0d-5)
++    dzeta_dru = (1.0_dp - zeta) / rho
++    dzeta_drd = -(1.0_dp + zeta) / rho
++    dzp_dzeta = (2.0_dp/3.0_dp) * ( (1.0_dp + zeta)**(1.0_dp/3.0_dp) - (1.0_dp - zeta)**(1.0_dp/3.0_dp) )
++    dx1_dzeta = dzp_dzeta / (zeta_p + 1.0d-5)
++    dx1_dru = dx1_dzeta * dzeta_dru
++    dx1_drd = dx1_dzeta * dzeta_drd
++    ds_drho_c = -(4.0_dp/3.0_dp) * s / rho
++    ds_dg_c = 1.0_dp / (2.0_dp * b_kF * rho**(4.0_dp/3.0_dp))
++    dx2_drho_c = dx2_ds_c * ds_drho_c
++    dx2_dg_c = dx2_ds_c * ds_dg_c
++    dedrho_c(1) = Fc * vcunif(1) + ec_den * (dFc_dx0 * dx0_drho_c + dFc_dx1 * dx1_dru + dFc_dx2 * dx2_drho_c)
++    dedrho_c(2) = Fc * vcunif(2) + ec_den * (dFc_dx0 * dx0_drho_c + dFc_dx1 * dx1_drd + dFc_dx2 * dx2_drho_c)
++
++    ! Gradient derivatives
++    dFx_dg_u = dFx_dx2_u * dx2_ds_u * ds_dg_u
++    if (gU > tiny) then
++      dedg_x_u = ex_den_up * dFx_dg_u
++    else
++      dedg_x_u = 0.0_dp
++    end if
++
++    dFx_dg_d = dFx_dx2_d * dx2_ds_d * ds_dg_d
++    if (gD > tiny) then
++      dedg_x_d = ex_den_dn * dFx_dg_d
++    else
++      dedg_x_d = 0.0_dp
++    end if
++
++    dedg_c = ec_den * (dFc_dx2 * dx2_dg_c)
++
++    if (nSpin == 1) then
++      if (gU > tiny .and. gD > tiny) then
++        do k = 1,3
++          dEXdGD(k,1) = 0.5_dp * (dedg_x_u * GradU(k)/gU + dedg_x_d * GradD(k)/gD)
++          dECdGD(k,1) = dedg_c * (Gtot(k)/g)
++        end do
++      else
++        dEXdGD(:,1) = 0.0_dp
++        dECdGD(:,1) = 0.0_dp
++      end if
++    else
++      if (gU > tiny) then
++        do k = 1,3
++          dEXdGD(k,1) = dedg_x_u * GradU(k)/gU
++          dECdGD(k,1) = dedg_c * (Gtot(k)/g)
++        end do
++      else
++        dEXdGD(:,1) = 0.0_dp
++        dECdGD(:,1) = 0.0_dp
++      end if
++      if (gD > tiny) then
++        do k = 1,3
++          dEXdGD(k,2) = dedg_x_d * GradD(k)/gD
++          dECdGD(k,2) = dedg_c * (Gtot(k)/g)
++        end do
++      else
++        dEXdGD(:,2) = 0.0_dp
++        dECdGD(:,2) = 0.0_dp
++      end if
++    end if
++
++    if (nSpin == 1) then
++      dEXdD(1) = 0.5_dp * (dedrho_x(1) + dedrho_x(2))
++      dECdD(1) = 0.5_dp * (dedrho_c(1) + dedrho_c(2))
++    else
++      dEXdD(1) = dedrho_x(1)
++      dEXdD(2) = dedrho_x(2)
++      dECdD(1) = dedrho_c(1)
++      dECdD(2) = dedrho_c(2)
++    end if
++
++  end subroutine NNGGAXC
++
++end module xc_nn_siesta
+\ No newline at end of file

@@ -1,187 +1,124 @@
-# NXC – Neural-Network XC for SIESTA
+# NXC-Siesta: neural-network exchange-correlation functionals in SIESTA
 
-This directory contains the neural-network GGA exchange–correlation (NNXC) functional for SIESTA, validated against a JAX/PySCF reference implementation.
+NXC-Siesta runs neural-network GGA exchange-correlation functionals, trained in
+JAX/Equinox, natively inside [SIESTA](https://siesta-project.org). The networks are
+exported to plain-text parameter files and evaluated by a Fortran implementation of the
+network in SIESTA's XC module, with analytic first derivatives. No libtorch or Python is
+needed at run time.
 
-- `models/` – JAX/Equinox trained models (.eqx, JSON).
-- `weights/` – Exported ASCII parameters used by SIESTA.
-- `validation/` – Fortran and Python tests for energies and first derivatives.
-- `grids/` – Reference density/gradient grids used in validation.
-- `legacy/` – Archived unpolarized tools and earlier versions.
+It is the route used for the periodic SIESTA calculations of the cloning paper
+(Navarro-Rodríguez *et al.*, arXiv:2605.10331). For PySCF and Quantum ESPRESSO, and for
+meta-GGAs, see [libnxc](https://github.com/marivifsSBU/libnxc).
 
-The functional is validated to machine precision for NN outputs and ~1e-8 for first analytic derivatives.
+## Contents
 
-SIESTA computes the divergence term numerically on the real-space grid; validation focuses on energy density and first derivatives.
+| path | content |
+|---|---|
+| `siesta/` | `xc_nn.f90` (network forward pass and derivatives), `xc_nn_siesta.f90` (the `NNGGA` functional), and a patch against SIESTA `rel-4.1` |
+| `export_eqx_to_fortran.py`, `export_nnxc.sh` | export an Equinox model pair (F_x, F_c) to SIESTA parameter files |
+| `models.py` | the Equinox model classes, needed to load the checkpoints |
+| `models/` | trained models: spin-aware PBE clones (`polarized/`) and unpolarized clones (`unpolarized/`) |
+| `weights/` | exported parameter files, ready for SIESTA |
+| `examples/Oatom/` | spin-polarized triplet O atom, NN-GGA vs PBE |
+| `validation/` | Fortran tests and Python/JAX references, with the validation report |
+| `legacy/` | earlier unpolarized tools, kept for reference |
 
-See `validation/docs/NNXC_validation_report.md` for full technical details.
+## Getting a SIESTA build with NNGGA
 
+The NN functional needs a SIESTA 4.1 build that includes the files in `siesta/`. Two options:
 
-# Neural-Network GGA XC (NNXC)
+1. **Use the fork.** Clone https://gitlab.com/Marivi.Fernandez-Serra/siesta and check out
+   branch `nnxc-spin` (spin-polarized and unpolarized, `nSpin = 1, 2`). Then build SIESTA as
+   usual.
+2. **Patch upstream SIESTA.** Apply `siesta/siesta-rel-4.1-nnxc-spin.patch` to SIESTA
+   `rel-4.1` (commit `9d7c63051`) and build as usual:
+   ```bash
+   cd siesta-rel-4.1 && git apply /path/to/NXC-Siesta/siesta/siesta-rel-4.1-nnxc-spin.patch
+   ```
+   The patch adds the two Fortran files to `Src/SiestaXC/`, adds an `NNGGA` branch to
+   `ggaxc.f`, and extends the SiestaXC makefile.
 
-## Usage & Validation Guide
+Non-collinear spin (`nSpin = 4`) is not supported; `NNGGAXC` aborts.
 
-This directory documents and supports the **NN-based GGA XC functional (NNXC)** used in SIESTA and validated against the JAX/PySCF reference implementation.
-
-This README explains:
-
-1. How to export NN parameters from JAX/PySCF to SIESTA
-2. How to activate NNXC in a SIESTA input file
-3. How to validate energies and first derivatives
-4. Important numerical and conceptual notes
-
----
-
-## 1. Exporting NN Parameters from PySCF/JAX
-
-### Prerequisites
-
-- Trained or pre-trained models saved as:
-
-```
-GGA_Fx_*.eqx
-GGA_Fc_*.eqx
-```
-
-- You are inside the JAX/PySCF environment.
-
-### Export Command
-
-Use the export utility to generate ASCII parameter files compatible with SIESTA:
+## 1. Export a trained model
 
 ```bash
-python export_nnxc_to_fortran.py \
-    --fx-model model1/GGA_Fx_xcdiff_d3_n16_s42_v_20000 \
-    --fc-model model1/GGA_Fc_xcdiff_d3_n16_s42_v_20000 \
-    --prefix nn_params/xc_nn_spin
+python export_eqx_to_fortran.py \
+    --fx-model models/polarized/pt_s05_TL_N20k_25m/GGA_Fx_xcdiff_d3_n16_s42_v_20000 \
+    --fc-model models/polarized/pt_s05_TL_N20k_25m/GGA_Fc_xcdiff_d3_n16_s42_v_20000 \
+    --out-prefix xc_nn_spin --out-dir nn_params
 ```
+This writes `nn_params/xc_nn_spin_{fx,fc}_{W,b}{1..4}.dat`. `export_nnxc.sh` is a
+wrapper that does the same and stages the files. It needs Python with `jax`, `equinox` and
+`numpy`.
 
-This creates files such as:
+The Fortran code uses the tanh-approximate GELU (`jax.nn.gelu` with `approximate=True`, the
+JAX default), as in training. The erf form changes E_xc by a few mEh.
 
-```
-nn_params/xc_nn_spin_fx_W1.dat
-nn_params/xc_nn_spin_fx_b1.dat
-nn_params/xc_nn_spin_fc_W1.dat
-nn_params/xc_nn_spin_fc_b1.dat
-...
-```
-
-The prefix must match what is used in the SIESTA input file.
-
-### Important Implementation Detail
-
-The Fortran code uses **tanh-approximate GELU** to match JAX 0.7.x default behavior:
-
-```
-jax.nn.gelu(x, approximate=True)
-```
-
----
-
-## 2. Activating NNXC in a SIESTA `.fdf` Input File
-
-Include the following block in your SIESTA input:
+## 2. Run SIESTA
 
 ```text
-# ---------- XC functional ----------
-XC.Functional      GGA
-XC.Authors         NNGGA
-
-NNXC.Prefix        nn_params/xc_nn_spin
-
-# Neural network architecture (must match exported model)
-NNXC.FX_IN         1    # Number of inputs for Fx network
-NNXC.FC_IN         3    # Number of inputs for Fc network
-NNXC.H             16   # Hidden-layer width (neurons per layer)
+XC.Functional   GGA
+XC.Authors      NNGGA
+NNXC.Prefix     nn_params/xc_nn_spin
+NNXC.FX_IN      1        # inputs of the F_x network
+NNXC.FC_IN      3        # inputs of the F_c network
+NNXC.H          16       # hidden-layer width
+# NNXC.FX_MODE / NNXC.FC_MODE   TL (default, constrained) or UNCT (unconstrained models)
+SpinPolarized   true     # optional; nSpin = 1 and 2 are supported
 ```
+The prefix and architecture must match the exported model. For the unconstrained
+`pt_s05_UT_N20k_25m` model, set `NNXC.FX_MODE UNCT` and `NNXC.FC_MODE UNCT`.
 
-### Notes
+The enhancement factors multiply SIESTA's own LDA references: `EXCHNG` (exchange, per spin
+channel) and `PW92C` (correlation).
 
-- `XC.Authors NNGGA` activates the NN-based GGA functional.
-- `NNXC.Prefix` must match the exported parameter file prefix.
-- `NNXC.FX_IN`, `NNXC.FC_IN`, and `NNXC.H` must match the architecture of the trained/exported model.
+## Models
 
-If using an unpolarized model:
+| directory | model |
+|---|---|
+| `polarized/pt_s05_TL_N20k_25m` | spin-aware PBE clone with exact constraints (cloning paper) |
+| `polarized/pt_s05_UT_N20k_25m` | the same, unconstrained |
+| `polarized/pt_s05_TL_N20k_25m_SIESTA` | constrained clone trained on SIESTA (pseudo-valence) densities |
+| `unpolarized/pretrained_in_slim05`, `pretrained_in_SIESTA_slim05`, `pretrained_in_x0x1grid` | unpolarized PBE clones |
 
-```text
-NNXC.Prefix        nn_params/xc_nn
-```
+`weights/polarized/` holds the export of `pt_s05_TL_N20k_25m`.
 
----
+## Validation
 
-## 3. Validation Workflow
+`validation/fortran/` holds the tests, which build against the files in `siesta/`.
+`validation/python/` holds the JAX/PySCF references.
+`validation/docs/NNXC_validation_report.md` gives the full procedure. The steps are:
 
-### Step 1 — Validate NN Forward Pass (Fx, Fc Only)
+1. **Forward pass** (`test_1d_fx_fc.f90` vs `test_1d_jax_fx_fc.py`). F_x and F_c agree
+   with the JAX model to machine precision: max |ΔF| = 4e-15 for `pt_s05_TL_N20k_25m`.
+2. **First derivatives on a 1D analytic density** (`test_1d_nngga.f90`): about 1e-8.
+3. **A real 3D SIESTA grid** (`test_xc_nn.f90` vs `test_xc_nn_jax_pyscf.py`): e_xc, energy
+   density, ∂e/∂ρ and ∂e/∂∇ρ.
 
-```bash
-./test_1d_fx_fc
-```
+Do not compare the final grid potentials directly. PySCF treats the divergence term
+∇·(∂e/∂∇ρ) analytically, while SIESTA evaluates it numerically on the real-space mesh
+(Balbás, Martins and Soler, PRB 64, 165110 (2001)). Differences there are discretization,
+not inconsistency.
 
-Compare with Python reference.
+## Authors and credits
 
-**Expected tolerance:** ~1e-15 (machine precision)
+Sara Navarro-Rodríguez (ICN2) and Marivi Fernández-Serra (Stony Brook University). See
+[AUTHORS.md](AUTHORS.md).
 
----
+## Citing
 
-### Step 2 — Validate First Analytic Derivatives (1D Analytic Density)
+S. Navarro-Rodríguez, A. Wills, K. J. Daas, M. Camarasa-Gómez and M. Fernández-Serra,
+*Constraint-aware functional cloning for stable and transferable machine-learned density
+functional theory*, arXiv:2605.10331 (2026). See also [CITATION.cff](CITATION.cff).
 
-```bash
-./test_1d_nngga
-```
+## Acknowledgments
 
-Compare with Python reference.
+This work was supported by the U.S. National Science Foundation under award DMR-2427902.
+S. N.-R. acknowledges the Joan Oró predoctoral program of the Generalitat de Catalunya
+(2024 FI-I 00704).
 
-**Expected tolerance:**
+## License
 
-- First derivatives: ~1e-8
-- Energy density: ~1e-7 (LDA reference differences)
-
----
-
-### Step 3 — Validate Real 3D Grid Test
-
-```bash
-./test_xc_nn
-python dump_jax_grid_csv.py
-```
-
-Compare:
-
-- `exc`
-- `edens`
-- `vrhou`, `vrhod`
-- Gradient-vector derivatives (`Pu`, `Pd`)
-
-⚠️ **Do NOT compare final KS potentials directly.**
-
----
-
-## 4. Important Conceptual Note
-
-The XC potential is defined as:
-
-```
-v_xc = ∂e/∂ρ − ∇·(∂e/∂∇ρ)
-```
-
-- **PySCF** handles the divergence term analytically via integration by parts inside matrix element construction.
-- **SIESTA** evaluates the divergence numerically on the real-space grid (Balbás & Soler, PRB 64, 165110).
-
-Therefore:
-
-- Differences in final grid potentials are due to discretization, not functional inconsistency.
-- Validation should focus on energy density and first derivatives.
-
----
-
-## 5. Numerical Safety
-
-Reduced gradients are defined with a tiny denominator to avoid NaNs when ρ → 0:
-
-```
-s = |∇ρ| / (2 k_F ρ + 1e-30)
-```
-
-This matches the JAX-side practice and prevents division-by-zero issues in vacuum regions.
-
----
-
-**End of README**
+GPL-3.0 ([LICENSE](LICENSE)), the license of SIESTA, into which the Fortran code is
+compiled.

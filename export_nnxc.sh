@@ -22,8 +22,8 @@ Options:
 
 Example:
   ./export_nnxc.sh \
-    --fx-model Sample-Models/GGA_Fx_G_transf_lin_d3_n16_s42_v_20000 \
-    --fc-model Sample-Models/GGA_Fc_G_transf_lin_d3_n16_s42_v_20000 \
+    --fx-model models/unpolarized/pretrained_in_slim05/GGA_Fx_G_transf_lin_d3_n16_s42_v_20000 \
+    --fc-model models/unpolarized/pretrained_in_slim05/GGA_Fc_G_transf_lin_d3_n16_s42_v_20000 \
     --out-prefix xc_nn
 
 This will create:

@@ -2,5 +2,10 @@
 __pycache__/
 *.mod
 *.o
-test_*
 runs/
+# compiled test programs and their output (sources are tracked)
+test_*
+!test_*.f90
+!test_*.py
+fortran_*.csv
+jax_*.csv

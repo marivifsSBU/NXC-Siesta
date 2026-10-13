@@ -1,0 +1,60 @@
+SystemName        O_atom
+SystemLabel       O_atom
+
+NumberOfAtoms     1
+NumberOfSpecies   1
+
+%block ChemicalSpeciesLabel
+  1  8  O
+%endblock ChemicalSpeciesLabel
+
+# Large box to mimic an isolated atom
+LatticeConstant   10.0 Ang
+%block LatticeVectors
+  1.0  0.0  0.0
+  0.0  1.0  0.0
+  0.0  0.0  1.0
+%endblock LatticeVectors
+
+AtomicCoordinatesFormat  Ang
+%block AtomicCoordinatesAndAtomicSpecies
+  0.0  0.0  0.0   1
+%endblock AtomicCoordinatesAndAtomicSpecies
+
+# ---------- Spin settings ----------
+SpinPolarized     true
+
+# Oxygen atom ground state is triplet (2S+1 = 3), so S = 1 -> N_up - N_dn = 2
+# In SIESTA this is set via TotalSpin (= N_up - N_dn).
+TotalSpin         2
+
+# ---------- XC functional ----------
+XC.functional     GGA
+XC.authors        NNGGA
+NNXC.Prefix       nn_params/xc_nn_spin
+NNXC.FX_IN 1  # Number of inputs for Fx NN
+NNXC.FC_IN 3  # Number of inputs for FcNN
+NNXC.H     16 # Number of Neurons per Hidden layer 
+
+# Note currently #of hidden layers is fixed to 3!
+
+# ---------- Basis ----------
+# Comparable to TZP in SIESTA (you can adjust later)
+PAO.BasisSize     TZP
+
+# ---------- Real-space grid ----------
+MeshCutoff        500 Ry
+
+# ---------- SCF controls ----------
+MaxSCFIterations  200
+DM.Tolerance      1.d-4
+DM.MixingWeight   0.05
+DM.NumberPulay    6
+DM.KerkerFactor   1.5
+
+ElectronicTemperature  100 K
+
+# ---------- Output ----------
+WriteDenchar      true
+WriteMullikenPop  1
+WriteCoorXmol     true

@@ -20,7 +20,7 @@ import jax
 import equinox as eqx
 import os
 
-from nnxc_tools.models import load_eqx_model
+from models import load_eqx_model
 
 def extract_mlp_params(mlp):
     """Return lists of (W, b) for each Linear layer in the Equinox MLP.

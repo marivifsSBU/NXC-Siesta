@@ -4,7 +4,7 @@
 
 **Project:** Neural-Network GGA XC Functional (SIESTA ↔ JAX Consistency)
 
-**Location:** `Util/NXC/debug/`
+**Location:** `validation/` (Fortran tests in `validation/fortran/`, Python references in `validation/python/`)
 
 **Objective:**
 Establish numerical equivalence between the JAX/Equinox implementation of the NN-based GGA exchange–correlation functional and the Fortran implementation used in SIESTA (SiestaXC), targeting ~1e-8 agreement for first-order analytic derivatives.

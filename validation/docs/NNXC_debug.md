@@ -1,6 +1,6 @@
 # NNXC JAX ↔ Fortran Consistency Debug Log
 
-Location: `Util/NXC/debug/`
+Location: `validation/` (Fortran tests in `validation/fortran/`, Python references in `validation/python/`)
 
 Goal: Make the Fortran (SIESTA/SiestaXC) NN implementation numerically identical to the JAX/Equinox implementation, targeting ~1e-8 agreement for energies and gradients.
 
